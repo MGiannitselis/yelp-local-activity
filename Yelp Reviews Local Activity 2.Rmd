@@ -1,0 +1,2164 @@
+---
+title: "Master file -Reviews part 2"
+author: "Manos Giannitselis"
+date: "2025-06-01"
+output: html_document
+---
+
+```{r setup-part2, include=FALSE}
+# ── Part 2 requires these packages (standalone-safe library block) ─────────────
+required_packages <- c(
+  "readr", "dplyr", "ggplot2", "tidyr", "purrr", "stringr", "forcats",
+  "lubridate", "zoo", "knitr", "kableExtra", "broom", "did",
+  "fixest", "sandwich", "lmtest", "car", "scales"
+)
+install_missing_packages <- function(pkgs) {
+  miss <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+  if (length(miss)) install.packages(miss)
+}
+install_missing_packages(required_packages)
+lapply(required_packages, library, character.only = TRUE)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# ── Reproducibility ────────────────────────────────────────────────────────────
+set.seed(42)
+
+# ── Load all objects produced by Part 1 ───────────────────────────────────────
+# These must exist on disk (produced by running Part 1 first).
+agg_trim_pca_covid  <- readRDS("agg_trim_pca_covid.rds")
+agg_imp_pca_covid   <- readRDS("agg_imp_pca_covid.rds")
+sect_trim_pca_covid <- readRDS("sect_trim_pca_covid.rds")
+sect_imp_pca_covid  <- readRDS("sect_imp_pca_covid.rds")
+panel_full_trim     <- readRDS("full_panel.rds")          # sector-level full panel
+panel_full_imp      <- readRDS("sect_panel.rds")          # imputed sector panel
+pca                 <- readRDS("pca.rds")                 # PCA object for rotation checks
+controls_raw        <- readRDS("controls_raw.rds")        # character vector of control names
+n_pcs               <- 4                                  # must match Part 1
+
+# ── Load aggregate DiD objects saved at the end of Part 1 ─────────────────────
+# (used in the event-study chunks below)
+if (file.exists("did_est.rds"))  did_est  <- readRDS("did_est.rds")
+if (file.exists("did_ap.rds"))   did_ap   <- readRDS("did_ap.rds")
+if (file.exists("did_qp1.rds"))  did_qp1  <- readRDS("did_qp1.rds")
+if (file.exists("did_mod3.rds")) did_mod3 <- readRDS("did_mod3.rds")
+```
+
+
+```{r}
+make_ipw_treated <- function(df){
+  df2 <- df %>%
+    arrange(county_name, year) %>%
+    group_by(county_name) %>%
+    mutate(
+      avg_log_reviews = as.numeric(avg_log_reviews),
+      d_review        = avg_log_reviews - lag(avg_log_reviews)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(d_review), !is.na(PC1), !is.na(PC2), !is.na(PC3), !is.na(PC4))
+
+  mu0    <- mean(df2$d_review)
+  sigma0 <- sd(df2$d_review)
+
+  cond_mod  <- lm(d_review ~ PC1 + PC2 + PC3 + PC4, data = df2)
+  mu_hat    <- predict(cond_mod, df2)
+  sigma_hat <- sd(residuals(cond_mod))
+
+  df2 <- df2 %>%
+    mutate(
+      log_num   = dnorm(d_review, mu0,    sigma0,    log = TRUE),
+      log_den   = dnorm(d_review, mu_hat, sigma_hat, log = TRUE),
+      log_wt    = log_num - log_den
+    ) %>%
+    mutate(
+      log_wt_c = log_wt - median(log_wt, na.rm = TRUE),
+      ipw_wt   = exp(log_wt_c)
+    ) %>%
+    mutate(ipw_wt = ipw_wt / mean(ipw_wt, na.rm = TRUE))
+
+  return(df2)
+}
+
+panels <- list(
+  agg_trim_covid  = agg_trim_pca_covid,
+  agg_imp_covid   = agg_imp_pca_covid,
+  sect_trim_covid = sect_trim_pca_covid,
+  sect_imp_covid  = sect_imp_pca_covid
+)
+panels_wt_treated <- lapply(panels, make_ipw_treated)
+
+pdf("ipw_weights_histograms.pdf", width = 8, height = 6)
+par(mfrow = c(2,2), mar = c(4,4,2,1))
+for (name in names(panels_wt_treated)) {
+  w <- panels_wt_treated[[name]]$ipw_wt
+  hist(w, breaks = 30, main = paste("IPW weights:", name), xlab = "Weight", ylab = "Count")
+}
+dev.off()
+
+save(
+  panels_wt_treated,
+  file = "panels_wt_treated.RData"
+)
+
+for (name in names(panels_wt_treated)) {
+  saveRDS(panels_wt_treated[[name]], file = paste0(name, "_wt.rds"))
+}
+
+save(
+  agg_trim_pca_covid,
+  agg_imp_pca_covid,
+  sect_trim_pca_covid,
+  sect_imp_pca_covid,
+  file = "covid_panels.RData"
+)
+
+saveRDS(agg_trim_pca_covid,  "agg_trim_pca_covid.rds")
+saveRDS(agg_imp_pca_covid,   "agg_imp_pca_covid.rds")
+saveRDS(sect_trim_pca_covid, "sect_trim_pca_covid.rds")
+saveRDS(sect_imp_pca_covid,  "sect_imp_pca_covid.rds")
+
+```
+
+
+
+```{r}
+df <- panels_wt_treated$agg_trim_covid %>%
+  filter(!is.na(ipw_wt))
+
+fe_mod <- lm(emp ~ avg_log_reviews + factor(county_name) + factor(year), data = df, weights = ipw_wt)
+coeftest(fe_mod, vcov = vcovCL, cluster = ~county_name)
+capture.output(summary(fe_mod), file = "fe_mod_summary.txt")
+coef_row <- summary(fe_mod)$coefficients["avg_log_reviews", ]
+capture.output(coef_row, file = "avg_log_reviews_coef.txt")
+
+```
+
+
+```{r}
+fe_mod <- lm(est ~ avg_log_reviews + factor(county_name) + factor(year), data = df, weights = ipw_wt)
+coeftest(fe_mod, vcov = vcovCL, cluster = ~county_name)
+capture.output(summary(fe_mod), file = "est_fe_mod_summary.txt")
+coef_row <- summary(fe_mod)$coefficients["avg_log_reviews", ]
+capture.output(coef_row, file = "est_avg_log_reviews_coef.txt")
+
+```
+
+```{r}
+fe_mod2 <- lm(
+  est ~ avg_log_reviews + PC1 + PC2 + PC3 + PC4 + factor(county_name) + factor(year),
+  data    = df,
+  weights = ipw_wt
+)
+coeftest(fe_mod2, vcov = vcovCL, cluster = ~county_name)
+capture.output(summary(fe_mod2), file = "est_fe_mod2_summary.txt")
+coef_row <- summary(fe_mod2)$coefficients["avg_log_reviews", ]
+capture.output(coef_row, file = "avg_log_reviews_coef2.txt")
+
+```
+
+
+```{r}
+vif(lm(avg_log_reviews ~ PC1 + PC2 + PC3 + PC4, data = df))
+for (pc in paste0("PC", 1:4)) {
+  f <- as.formula(
+    paste("est ~ avg_log_reviews +", paste(setdiff(paste0("PC", 1:4), pc), collapse = " + "), "+ factor(county_name) + factor(year)")
+  )
+  print(pc)
+  print(coeftest(lm(f, data = df, weights = ipw_wt), vcov = vcovCL, cluster = ~county_name)["avg_log_reviews", ])
+}
+cor(df$avg_log_reviews, df$PC3, use = "pairwise.complete.obs")
+summary(pca)$rotation[, "PC3"]
+
+```
+
+
+
+
+
+```{r}
+panel_full_trim <- panel_full_trim %>% 
+  mutate(category_group = factor(category_group, 
+                         levels = c("Retail","Health","Food","Other")))
+
+df_sec <- panel_full_trim
+
+df_sec <- df_sec %>%
+  mutate(
+    county_sector = paste(county_name, category_group, sep = "_")
+  )
+
+df_sec %>% 
+  distinct(county_name, category_group, county_sector) %>% 
+  head(10)
+
+```
+
+
+
+
+```{r}
+
+panel_full_trim <- panel_full_trim %>%
+  mutate(county_sector = interaction(county_name, category_group, sep="_"))
+
+
+
+
+sect_trim <- panel_full_imp %>%
+  filter(if_all(all_of(controls_raw), ~ !is.na(.x))) %>%
+  mutate(
+    county_sector   = paste(county_name, category_group, sep = "_"),
+    num_reviews     = replace_na(num_reviews, 0L),
+    avg_log_reviews = replace_na(avg_log_reviews, 0),
+    avg_rating      = replace_na(avg_rating, 0)
+  )
+
+```
+
+```{r}
+
+control_sec <- sect_trim_pca %>%
+  select(county_name, year, category_group,
+         pct_employed, avg_educ, total_pop, pct_female,
+         avg_age, pct_white, avg_income_real)
+
+pca_input <- control_sec %>%
+  select(pct_employed, avg_educ, total_pop, pct_female,
+         avg_age, pct_white, avg_income_real)
+
+apply(pca_input, 2, sd, na.rm=TRUE)
+apply(pca_input, 2, function(x) length(unique(x)))
+
+pca_sec <- prcomp(pca_input, center = TRUE, scale. = TRUE)
+
+
+summary(pca_sec)            
+screeplot(pca_sec, type="lines")
+
+# 5. Look at the first 4 loadings
+print(pca_sec$rotation[, 1:4], digits = 3)
+
+
+pca_summary <- summary(pca_sec)
+capture.output(pca_summary, file = "pca_sec_trim_summary.txt")
+
+pdf("sec_trim_pca_screeplot.pdf", width = 7, height = 5)
+screeplot(pca_sec, type = "lines")
+dev.off()
+#############################
+
+loadings_4 <- pca_sec$rotation[, 1:4]
+
+write.table(
+  round(loadings_4, 3),            
+  file      = "sect_trim_pca_loadings_PC1_to_PC4.txt",
+  sep       = "\t",                
+  quote     = FALSE,              
+  row.names = TRUE,                
+  col.names = NA                  
+)
+
+###################################################
+scores_sec <- as_tibble(pca_sec$x[,1:4], .name_repair="minimal") %>%
+  set_names(paste0("PC", 1:4)) %>%
+  bind_cols(control_sec %>% select(county_name, year, category_group))
+
+scores_sec %>%
+  count(county_name, year, category_group) %>%
+  filter(n > 1)
+scores_sec <- scores_sec %>%
+  distinct(county_name, year, category_group, .keep_all = TRUE)
+
+# FIX: renamed from sect_trim_pca to sect_trim_pca_sec to avoid overwriting the
+# aggregate-level sect_trim_pca object defined earlier in this script.
+sect_trim_pca_sec <- sect_trim %>%
+  left_join(scores_sec,
+            by = c("county_name","year","category_group"))
+
+saveRDS(sect_trim_pca_sec, "sect_trim_pca_sec.rds")
+
+
+```
+
+
+
+
+
+```{r}
+sect_trim_pca %>%
+  group_by(category_group, year) %>%
+  summarize(
+    est_mean = mean(est, na.rm=TRUE),
+    est_se   = sd(est, na.rm=TRUE)/sqrt(n()),
+    avg_rev  = mean(avg_log_reviews, na.rm=TRUE)
+  ) %>%
+ggplot(aes(year, est_mean, color=category_group)) +
+  geom_line() +
+  geom_ribbon(aes(ymin=est_mean-1.96*est_se,
+                  ymax=est_mean+1.96*est_se,
+                  fill=category_group),
+              alpha=0.2) +
+  labs(title="County x Sector Establishments over Time",
+       y="Mean Establishments", x="Year")
+
+```
+
+
+```{r}
+sect_trim_pca %>%
+  filter(!is.na(post_intro)) %>%
+  group_by(category_group) %>%
+  filter(any(post_intro == 0) && any(post_intro == 1)) %>%
+  do(tidy(t.test(emp ~ post_intro, data = .))) %>%
+  select(
+    category_group,
+    mean_pre   = estimate2,  
+    mean_post  = estimate1,  
+    t_stat     = statistic,
+    p_value    = p.value
+  )
+
+```
+
+
+```{r}
+# FIX: replaced stale 'sect2' with 'sect_trim_pca' and 'post_intro_sec' with 'post_intro'
+sect_trim_pca %>% 
+  filter(!is.na(post_intro)) %>% 
+  group_by(category_group) %>% 
+  summarize(
+    n_pre  = sum(post_intro == 0),
+    n_post = sum(post_intro == 1)
+  ) %>% 
+  filter(n_pre > 0 & n_post > 0)
+
+```
+
+
+```{r}
+library(forcats)
+
+sect_trim_pca_clean <- sect_trim_pca %>%
+  mutate(
+    # FIX: fct_explicit_na() is deprecated since forcats 1.0 — use fct_na_value_to_level()
+    category_group = fct_na_value_to_level(category_group, level = "NoReviews")
+  ) %>%
+  
+  mutate(
+    first_review = if_else(is.infinite(first_review), NA_real_, first_review),
+    
+    event_time   = if_else(
+                     is.na(first_review),
+                     NA_real_,
+                     year - first_review
+                   ),
+    
+    post_intro   = if_else(
+                     is.na(first_review),
+                     0L, 
+                     as.integer(year >= first_review)
+                   )
+  )
+
+```
+
+
+```{r}
+sect_trim_pca<-sect_trim_pca_clean
+sect_trim_pca %>% 
+  summarize(
+    n_inf_event = sum(is.infinite(event_time)),
+    n_na_event  = sum(is.na(event_time)),
+    n_inf_first = sum(is.infinite(first_review)),
+    n_na_first  = sum(is.na(first_review))
+  )
+valid_sectors <- sect_trim_pca %>% 
+  group_by(category_group) %>% 
+  filter(any(post_intro==0) && any(post_intro==1)) %>% 
+  pull(category_group) %>% unique()
+
+means_by_sector <- sect_trim_pca %>% 
+  filter(category_group %in% valid_sectors) %>% 
+  group_by(category_group) %>% 
+  do({
+    test = t.test(emp ~ post_intro, data = .)
+    tibble(
+      mean_pre  = test$estimate["mean in group 0"],
+      mean_post = test$estimate["mean in group 1"],
+      t_stat    = test$statistic,
+      p_value   = test$p.value
+    )
+  }) %>% 
+  ungroup()
+
+means_by_sector
+
+#######
+
+sect_trim_pca %>%
+  mutate(et = as.numeric(as.character(event_time))) %>%
+  filter(et < 0) %>%
+  tally(name = "n_pre_obs")
+
+sect_trim_pca %>%
+  mutate(et = as.numeric(as.character(event_time))) %>%
+  filter(et < 0) %>%
+  distinct(county_name) %>%
+  tally(name = "n_counties_pre")
+
+sect_check <- panel_full_imp %>%        
+  left_join(
+    first_intro_sec,                   
+    by = c("county_name","category_group")
+  ) %>%
+ 
+  mutate(
+    event_time = year - first_rev_sec
+  ) %>%
+  filter(is.finite(event_time)) 
+
+sect_check %>%
+  group_by(category_group, period = if_else(event_time < 0, "pre", "post")) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = n)
+sect_check %>%
+  group_by(category_group, event_time) %>%
+  tally() %>%
+  print(n = Inf)
+
+#Food
+
+food_df <- sect_trim_pca %>% 
+  filter(category_group == "Food", 
+         !is.na(event_time)) %>% 
+  mutate(post = event_time >= 0)
+
+food_df %>% 
+  count(post)
+
+
+
+food_df %>% 
+  group_by(post) %>% 
+  summarize(
+    mean_reviews = mean(avg_log_reviews, na.rm=TRUE),
+    n            = n()
+  )
+
+
+
+```
+
+```{r}
+
+es_sec <- sect_trim_pca %>% 
+
+  filter(!is.na(event_time) & between(event_time, -4, +4)) 
+
+es_mod_sec <- feols(
+  est ~ i(event_time, ref = -1) 
+      | county_sector + year,      
+  cluster = ~county_sector,
+  data    = es_sec
+)
+
+iplot(
+  es_mod_sec, 
+  xlab = "Years since first Yelp review (sector)", 
+  main = "Event Study: Establishments (±4 yrs) by Sector"
+)
+
+```
+
+
+
+```{r}
+sect_trim_pca %>%
+  group_by(category_group, year) %>%
+  summarize(
+    emp_var = var(emp, na.rm=TRUE), 
+    rev_var = var(avg_log_reviews, na.rm=TRUE)
+  ) %>%
+  pivot_longer(c(emp_var, rev_var), names_to="metric", values_to="v") %>%
+  ggplot(aes(year, v, color=metric)) +
+    geom_line() +
+    facet_wrap(~category_group) +
+    labs(title="Variance of Reviews vs. Employment by Sector")
+
+```
+
+
+```{r}
+first_intro <- panel_full_imp %>% 
+  group_by(county_name) %>%
+  summarize(
+    first_review = min(year[num_reviews > 0], na.rm = TRUE),
+    .groups      = "drop"
+  )
+
+sect_trim_pca <- sect_trim_pca %>% 
+  left_join(first_intro, by="county_name")
+
+```
+
+
+```{r}
+sect_trim_pca <- sect_trim_pca %>%
+  mutate(
+    post_intro = as.integer(year >= first_review), 
+    event_time = year - first_review
+  )
+
+```
+
+
+#heterogeneity by sector
+```{r}
+feols(
+  emp ~ i(category_group, did_bin)  + PC1+PC2+PC3+PC4
+  | county_sector + year,
+  data    = sect_trim_pca,
+  cluster = ~county_name
+)
+
+```
+
+```{r}
+map(levels(sect_trim_pca$category_group), ~
+  feols(
+    emp ~ post_intro | county_name + year,
+    data = filter(sect_trim_pca, category_group==.x),
+    cluster="county_name"
+  ) %>% coefplot(main=.x)
+)
+
+```
+
+```{r}
+controls <- c(
+  "avg_income_real", "avg_income",
+  "avg_age",         "avg_educ",
+  "pct_employed",    "pct_female",
+  "pct_white",       "total_pop"
+)
+sect_imp <- panel_full_imp %>% 
+  arrange(county_name, category_group, year) %>% 
+  group_by(county_name, category_group) %>% 
+  mutate(
+    across(
+      all_of(controls),
+      ~ na.approx(
+          .x,
+          x      = year,
+          na.rm  = FALSE,
+          rule   = 2    
+        )
+    )
+  ) %>% 
+  ungroup()
+
+sect_imp %>% 
+  summarise(across(
+    all_of(controls),
+    ~ sum(is.na(.)),
+    .names = "nNA_{col}"
+  ))
+
+#save it
+saveRDS(sect_imp, "sect_imp.rds")
+sect_imp <- readRDS("sect_imp.rds")
+
+```
+
+
+```{r}
+sect_trim_pca %>% 
+  summarise(across(
+    all_of(controls),
+    ~ sum(is.na(.)),
+    .names = "nNA_{col}"
+  ))
+
+```
+
+
+```{r}
+
+control_sec <- sect_imp_covid %>%
+  select(county_name, year, category_group,
+         pct_employed, avg_educ, total_pop, pct_female,
+         avg_age, pct_white, avg_income_real)
+
+pca_input <- control_sec %>%
+  select(pct_employed, avg_educ, total_pop, pct_female,
+         avg_age, pct_white, avg_income_real)
+
+
+apply(pca_input, 2, sd, na.rm=TRUE)
+apply(pca_input, 2, function(x) length(unique(x)))
+pca_sec <- prcomp(pca_input, center = TRUE, scale. = TRUE)
+summary(pca_sec)            
+screeplot(pca_sec, type="lines")
+
+print(pca_sec$rotation[, 1:4], digits = 3)
+
+########
+pca_summary <- summary(pca_sec)
+capture.output(pca_summary, file = "pca_sec_imp_summary.txt")
+
+pdf("pca_sec_imp_screeplot.pdf", width = 7, height = 5)
+screeplot(pca_sec, type = "lines")
+dev.off()
+
+# extract the first 4 loadings
+loadings_4 <- pca_sec$rotation[, 1:4]
+
+write.table(
+  round(loadings_4, 3),            
+  file      = "sect_imp_pca_loadings_PC1_to_PC4.txt",
+  sep       = "\t",                
+  quote     = FALSE,               
+  row.names = TRUE,               
+  col.names = NA                   
+)
+
+scores_sec <- as_tibble(pca_sec$x[,1:4], .name_repair="minimal") %>%
+  set_names(paste0("PC", 1:4)) %>%
+  bind_cols(control_sec %>% select(county_name, year, category_group))
+
+scores_sec %>%
+  count(county_name, year, category_group) %>%
+  filter(n > 1)
+scores_sec <- scores_sec %>%
+  distinct(county_name, year, category_group, .keep_all = TRUE)
+
+sect_imp_pca_covid <- sect_imp_covid %>%
+  left_join(scores_sec,
+            by = c("county_name","year","category_group"))
+
+saveRDS(sect_imp_pca_covid, "sect_imp_pca_covid.rds")
+sect_trim_pca_covid <- readRDS("sect_trim_pca_covid.rds")
+
+```
+
+
+#Callaway and Sant'Anna
+
+```{r}
+df <- panels_wt_treated$agg_trim_covid   
+
+df <- panels_wt_treated$agg_trim_covid %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    d_emp = emp - dplyr::lag(emp)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d_emp), !is.na(d_review))
+
+summary(df$d_emp)
+head(df[, c("county_name","year","emp","d_emp")], 10)
+
+#OLS
+outcome_mod <- lm(
+  d_emp ~ d_review + PC1 + PC2 + PC3 + PC4,
+  data = df
+)
+summary(outcome_mod)
+
+```
+
+```{r}
+df <- df %>%
+  mutate(mu_hat_emp = predict(outcome_mod, newdata = df),
+         resid_emp  = d_emp - mu_hat_emp)
+
+summary(df$mu_hat_emp)
+summary(df$resid_emp)
+
+```
+
+```{r}
+df <- df %>%
+  mutate(
+    dr_score = mu_hat_emp   + 
+               ipw_wt   * (d_emp - mu_hat_emp)
+  )
+summary(df$dr_score)
+hist(df$dr_score, breaks=30, main="DR Scores", xlab="dr_score")
+
+```
+
+
+```{r}
+df <- df %>%
+  mutate(
+    dr_score = mu_hat_emp   + 
+               ipw_wt   * (d_emp - mu_hat_emp)
+  )
+summary(df$dr_score)
+hist(df$dr_score, breaks=30, main="DR Scores", xlab="dr_score")
+
+```
+
+
+```{r}
+dr_mod <- lm(dr_score ~ d_review, data = df)
+summary(dr_mod)
+
+df_bins <- df %>%
+  mutate(
+    bin = ntile(d_review, 4),                    
+    mid = ave(d_review, bin, FUN = mean)         
+  )
+
+dose_resp <- df_bins %>%
+  group_by(bin, mid) %>%
+  summarize(
+    avg_dr = mean(dr_score, na.rm = TRUE),
+    n_obs  = n(),
+    .groups = "drop"
+  )
+
+print(dose_resp)
+
+plot(
+  dose_resp$mid, dose_resp$avg_dr,
+  type = "b", pch = 16,
+  xlab = "Δ avg_log_reviews (bin midpoint)",
+  ylab = "Average DR Score (Δ emp)",
+  main = "Binned Dose–Response"
+)
+
+```
+
+```{r}
+dose_resp_ci <- df_bins %>%
+  group_by(bin, mid) %>%
+  summarize(
+    avg_dr = mean(dr_score, na.rm = TRUE),
+    sd_dr  = sd(dr_score,   na.rm = TRUE),
+    n_obs  = n(),
+    se_dr  = sd_dr / sqrt(n_obs),
+    # 95% CI:
+    ci_lo  = avg_dr - 1.96 * se_dr,
+    ci_hi  = avg_dr + 1.96 * se_dr,
+    .groups = "drop"
+  )
+
+print(dose_resp_ci)
+
+with(dose_resp_ci, {
+  plot(mid, avg_dr, ylim = range(ci_lo, ci_hi),
+       pch = 16, xlab = "Δ avg_log_reviews", ylab = "Avg Δ emp",
+       main = "Dose–Response with 95% CI")
+  arrows(mid, ci_lo, mid, ci_hi, angle = 90, code = 3, length = 0.05)
+})
+
+```
+
+```{r}
+df <- df %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    d_emp_lag = dplyr::lag(d_emp)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d_emp), !is.na(d_emp_lag))
+
+outcome_mod3 <- lm(
+  d_emp ~ d_review 
+         + d_emp_lag
+         + PC1 + PC2 + PC3 + PC4
+         + covid_case_pct + covid_death_pct,
+  data = df
+)
+summary(outcome_mod3)
+
+```
+
+
+#did
+```{r did-setup}
+# FIX: removed broken install.packages() calls with stray ')' syntax error.
+# Packages are now loaded in the setup-part2 chunk at the top of this file.
+
+agg_trim_pca_covid <- agg_trim_pca_covid %>%
+  mutate(
+    g = if_else(is.na(first_review), 
+                0L,                
+                as.integer(first_review))
+  )
+```
+  yname         = "emp",
+  tname         = "year_num",
+  idname        = "county_id",
+  gname         = "g",                  
+  xformla       = ~ PC1 + PC2 + PC3 + PC4,
+  data          = agg_trim_pca_covid,
+  control_group = "notyettreated",       
+  est_method    = "dr",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+panel <- panels_wt_treated$agg_trim_covid %>%
+  mutate(year = as.integer(year)) %>%
+  mutate(
+    county_id = as.integer(factor(county_name)),
+    g         = if_else(is.na(first_review), 0L, as.integer(first_review))
+  )
+
+names(panel)
+
+set.seed(42)  # bootstrap reproducibility
+did_mod2 <- att_gt(
+  yname         = "emp",
+  tname         = "year",          
+  idname        = "county_id",
+  gname         = "g",              
+  xformla       = ~ PC1 + PC2 + PC3 + PC4,
+  data          = panel,
+  control_group = "notyettreated",
+  weightsname   = "ipw_wt",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+
+dr_data <- did_mod2$DIDparams$data
+summary(dr_data$.w)
+summary(did_mod2)
+
+```
+
+```{r}
+trim.emp.sdidpc <- summary(did_mod2)
+
+saveRDS(trim.emp.sdidpc, file = "trim.emp.sdidpc.rds")
+
+capture.output(
+  trim.emp.sdidpc,
+  file = "trim.emp.sdidpc.txt"
+)
+
+agg_att <- aggte(did_mod2,
+                 type    = "simple",
+                 na.rm   = TRUE)    
+summary(agg_att)
+
+```
+
+
+
+
+
+
+```{r}
+pre_trends <- with(es, 
+  data.frame(
+    event_time = egt, 
+    att        = att.egt, 
+    se         = se.egt,
+    ci_lo      = att.egt - 1.96 * se.egt,
+    ci_hi      = att.egt + 1.96 * se.egt
+  )
+)
+
+pre_trends <- pre_trends[pre_trends$event_time < 0, ]
+
+pre_trends
+
+```
+
+```{r}
+pre_effects <- tibble(
+  event_time = es$egt,
+  att         = es$att.egt,
+  se          = es$se.egt
+) %>%
+  filter(event_time < 0) %>%
+  mutate(
+    ci_lo       = att - 1.96 * se,
+    ci_hi       = att + 1.96 * se,
+    significant = !(ci_lo <= 0 & ci_hi >= 0)
+  )
+
+print(pre_effects)
+```
+
+
+
+
+```{r}
+agg_att <- aggte(did_mod2, type = "simple", na.rm = TRUE)
+summary(agg_att)
+
+saveRDS(agg_att, file = "agg_att_trim.emp.sdidpc.rds")
+write.csv(as.data.frame(agg_att), "agg_att_trim.emp.sdidpc.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+agg_att_df <- data.frame(
+  ATT   = agg_att$overall.att,
+  SE    = agg_att$overall.se,
+  CI_lo = agg_att$overall.att - 1.96 * agg_att$overall.se,
+  CI_hi = agg_att$overall.att + 1.96 * agg_att$overall.se
+)
+
+agg_att_df
+
+```
+
+```{r}
+agg_trim_pca_covid <- agg_trim_pca_covid %>%
+  mutate(region = factor(region_name)) 
+
+set.seed(42)
+did_mod3 <- att_gt(
+
+summary(did_mod3)
+
+agg_att3 <- aggte(did_mod3, type = "simple", na.rm = TRUE)
+
+summary(agg_att3)
+
+```
+
+
+```{r event-study-emp-regionFE-ggplot}
+# FIX: ggplot2 replaces base-R plot()/arrows() for the region FE event study
+es3 <- aggte(did_mod3, type = "dynamic", na.rm = TRUE)
+
+df_es3 <- tibble(
+  event_time = es3$egt,
+  att        = es3$att.egt,
+  se         = es3$se.egt
+) |>
+  mutate(ci_low = att - 1.96 * se, ci_high = att + 1.96 * se)
+
+p_es3 <- ggplot(df_es3, aes(x = event_time, y = att)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 2) +
+  scale_x_continuous(breaks = unique(df_es3$event_time)) +
+  labs(
+    title = "Event Study with Region FE",
+    x     = "Years since Yelp entry",
+    y     = "ATT(emp)"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_es3)
+ggsave("event_study_emp_regionFE.pdf", plot = p_es3, width = 8, height = 6)
+```
+
+```{r}
+fe_sunab <- feols(
+  dr_score ~ sunab(first_review, year) 
+  | county_name + year,
+  data    = df,
+  weights = ~ ipw_wt
+)
+
+iplot(fe_sunab,
+      main = "Weighted TWFE Event Study",
+      xlab = "Years Since Yelp Entry",
+      ylab = "ATT(emp)")
+
+```
+
+```{r}
+df_wt <- panels_wt_treated$agg_trim_covid
+
+df_diff <- df_wt %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    d_emp    = emp - lag(emp),
+    d_review = avg_log_reviews - lag(avg_log_reviews)
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(d_emp),
+    !is.na(d_review),
+    !is.na(ipw_wt)
+  )
+
+fe_diff_wt <- feols(
+  d_emp    ~ d_review
+    | county_name + year,
+  data    = df_diff,
+  weights = ~ ipw_wt,
+  cluster = ~ county_name
+)
+
+summary(fe_diff_wt)
+
+```
+
+```{r}
+df_all <- panels_wt$agg_trim %>%
+  mutate(post_intro = if_else(is.na(first_review), 0L, as.integer(year >= first_review)))
+
+fe_plain <- feols(
+  ap ~ post_intro
+    | county_name + year,
+  data    = df_all,
+  cluster = ~ county_name
+)
+
+summary(fe_plain)
+
+```
+
+
+```{r}
+ps_mod <- glm(
+  I(!is.na(first_review)) ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  family = binomial(),
+  data   = df_all
+)
+
+df_all <- df_all %>%
+  mutate(
+    ps    = predict(ps_mod, type = "response"),
+    ipw2  = if_else(
+      post_intro == 1,
+      1 / ps,
+      1 / (1 - ps)
+    )
+  )
+
+table(is.na(df_all$ipw2))
+
+fe_ipw_bin <- feols(
+  emp ~ post_intro
+    | county_name + year,
+  data    = df_all,
+  weights = ~ ipw2,
+  cluster = ~ county_name
+)
+
+summary(fe_ipw_bin)
+
+```
+
+#est
+```{r}
+set.seed(42)
+did_est <- att_gt(
+  yname         = "est",
+  tname         = "year",
+  idname        = "county_id",
+  gname         = "g",                # first_review group
+  xformla       = ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  data          = agg_trim_pca_covid,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+summary(did_est)
+saveRDS(did_est, "did_est.rds")
+
+es_est <- aggte(did_est, type="dynamic", na.rm = TRUE)
+agg_est <- aggte(did_est, type="simple", na.rm = TRUE)
+summary(agg_est)
+
+```
+
+
+
+```{r}
+trimmed <- dr_data %>%
+  filter(.w >= 0.1, .w <= 10)
+
+did_trimmed <- att_gt(
+  yname         = "emp",
+  tname         = "year_num",
+  idname        = "county_id",
+  gname         = "g",
+  xformla       = ~ PC1 + PC2 + PC3 + PC4,
+  data          = trimmed,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+
+summary(did_trimmed)
+
+```
+
+
+```{r}
+df_all <- df_all %>%
+  mutate(
+    region_name = factor(region_name)
+  )
+
+fe_regional_ts <- feols(
+  emp ~ post_intro 
+    | county_name + year + region_name:year,
+  data    = df_all,
+  cluster = ~ county_name
+)
+summary(fe_regional_ts)
+
+```
+
+
+```{r}
+did_est_reg <- att_gt(
+  yname         = "est",
+  tname         = "year",
+  idname        = "county_id",
+  gname         = "g",
+  xformla       = ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  data          = agg_trim_pca_covid,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+summary(aggte(did_est_reg, type="simple", na.rm=TRUE))
+
+```
+
+
+```{r}
+pre_est <- aggte(did_est_reg, type = "dynamic", na.rm = TRUE)
+df_pre_est <- data.frame(
+  event_time = pre_est$egt,
+  att        = pre_est$att.egt,
+  se         = pre_est$se.egt
+)
+
+# 3) Subset to t = -4,…,-1
+df_pre_est[df_pre_est$event_time < 0, ]
+
+```
+
+```{r}
+agg_trim_pca_covid %>%
+  group_by(region_name) %>%
+  summarize(
+    mean_PC1 = mean(PC1, na.rm = TRUE),
+    mean_PC2 = mean(PC2, na.rm = TRUE),
+    mean_PC3 = mean(PC3, na.rm = TRUE),
+    mean_PC4 = mean(PC4, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+summary(lm(PC1 ~ region_name, data = agg_trim_pca_covid))$r.squared
+
+```
+
+```{r}
+es_est <- aggte(did_est_reg, type = "dynamic", na.rm = TRUE)
+with(es_est, {
+  plot(egt, att.egt,
+       type = "b", pch = 16, lwd = 1.5,
+       xlab = "Years Since Yelp Entry",
+       ylab = "ATT(est)",
+       main = "Event Study: Yelp Entry → Establishments")
+  arrows(x0 = egt,
+         y0 = att.egt - 1.96 * se.egt,
+         x1 = egt,
+         y1 = att.egt + 1.96 * se.egt,
+         angle = 90, code = 3, length = 0.05)
+  abline(h = 0, lty = 2, col = "gray")
+})
+
+agg_est <- aggte(did_est_reg, type = "simple", na.rm = TRUE)
+
+agg_est_df <- data.frame(
+  ATT   = agg_est$overall.att,
+  SE    = agg_est$overall.se,
+  CI_lo = agg_est$overall.att - 1.96 * agg_est$overall.se,
+  CI_hi = agg_est$overall.att + 1.96 * agg_est$overall.se
+)
+agg_est
+
+```
+
+```{r event-study-est-ggplot}
+# FIX: replaced base-R plot()/arrows() with ggplot2 for consistency and cleaner export
+es_est <- aggte(did_est_reg, type = "dynamic", na.rm = TRUE)
+
+df_es_est <- tibble(
+  event_time = es_est$egt,
+  att        = es_est$att.egt,
+  se         = es_est$se.egt
+) |>
+  mutate(
+    ci_low  = att - 1.96 * se,
+    ci_high = att + 1.96 * se
+  )
+
+p_es_est <- ggplot(df_es_est, aes(x = event_time, y = att)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray70") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 2) +
+  scale_x_continuous(breaks = unique(df_es_est$event_time)) +
+  labs(
+    title = "Event-Study: Yelp Entry → Establishments",
+    x     = "Years Since Yelp Entry",
+    y     = "ATT(est)"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    axis.text.x  = element_text(angle = 45, hjust = 1)
+  )
+
+print(p_es_est)
+ggsave("es_establishments.pdf", plot = p_es_est, width = 6, height = 4)
+
+agg_est <- aggte(did_est_reg, type = "simple", na.rm = TRUE)
+agg_est_df <- data.frame(
+  outcome = "est",
+  ATT     = agg_est$overall.att,
+  SE      = agg_est$overall.se,
+  CI_lo   = agg_est$overall.att - 1.96 * agg_est$overall.se,
+  CI_hi   = agg_est$overall.att + 1.96 * agg_est$overall.se
+)
+print(agg_est_df)
+write.csv(agg_est_df, "aggregate_ATT_establishments.csv", row.names = FALSE)
+writeLines(
+  kable(agg_est_df, format = "latex", booktabs = TRUE,
+        caption = "Aggregate ATT: Yelp Entry → Establishments"),
+  "aggregate_ATT_establishments.tex"
+)
+```
+
+
+```{r}
+did_est <- att_gt(
+  yname         = "est",
+  tname         = "year_num",
+  idname        = "county_id",
+  gname         = "g",
+  xformla       = ~ PC1 + PC2 + PC3 + PC4,
+  data          = agg_trim_pca_covid,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+
+pre_est <- aggte(did_est, type = "dynamic", na.rm = TRUE)
+df_pre_est <- data.frame(
+  event_time = pre_est$egt,
+  att        = pre_est$att.egt,
+  se         = pre_est$se.egt
+)
+
+df_pre_est[df_pre_est$event_time < 0, ]
+
+```
+
+#AP
+```{r}
+
+fe_ap_ipw <- feols(
+  ap ~ post_intro
+    | county_name + year,
+  data    = df_all,
+  weights = ~ ipw2,
+  cluster = ~ county_name
+)
+
+# 3) View the results
+summary(fe_ap_ipw)
+
+```
+
+
+```{r event-study-qp1-ggplot}
+# FIX: ggplot2 replaces base-R plot()/arrows() for QP1 event study
+es_qp1 <- aggte(did_qp1, type = "dynamic", na.rm = TRUE)
+
+df_es_qp1 <- tibble(
+  event_time = es_qp1$egt,
+  att        = es_qp1$att.egt,
+  se         = es_qp1$se.egt
+) |>
+  mutate(ci_low = att - 1.96 * se, ci_high = att + 1.96 * se)
+
+p_es_qp1 <- ggplot(df_es_qp1, aes(x = event_time, y = att)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 2) +
+  scale_x_continuous(breaks = unique(df_es_qp1$event_time)) +
+  labs(
+    title = "Event-Study: Yelp Entry → Q1 Payroll",
+    x     = "Years Since Yelp Entry",
+    y     = "ATT(qp1)"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_es_qp1)
+ggsave("es_q1_payroll.pdf", plot = p_es_qp1, width = 6, height = 4)
+```
+
+
+```{r}
+options(scipen = 10)   # discourage scientific notation
+pdf("es_q1_payroll.pdf", width = 6, height = 4)
+plot(df_es_qp1$event_time, df_es_qp1$att,
+     type = "b", pch = 16, xaxt = "n",
+     xlab = "Years Since Yelp Entry",
+     ylab = expression(paste("ATT(", qp1, ")")),
+     main = "Event‐Study: Yelp Entry \u2192 Q1 Payroll")
+axis(1, at = unique(df_es_qp1$event_time))
+arrows(x0 = df_es_qp1$event_time,
+       y0 = df_es_qp1$ci_low,
+       x1 = df_es_qp1$event_time,
+       y1 = df_es_qp1$ci_high,
+       angle = 90, code = 3, length = 0.05)
+abline(h = 0, lty = 2, col = "gray")
+dev.off()
+
+```
+
+
+```{r}
+
+imp_wt_panel <- make_ipw_treated(agg_imp_pca_covid)
+
+df_imp <- imp_wt_panel %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    d_emp    = emp - lag(emp),
+    d_review = as.numeric(avg_log_reviews) - lag(as.numeric(avg_log_reviews))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d_emp), !is.na(d_review))
+
+out_mod_imp <- lm(d_emp ~ d_review + PC1 + PC2 + PC3 + PC4,
+                  data = df_imp)
+
+# 2c) DR score
+df_imp <- df_imp %>%
+  mutate(
+    mu_hat   = predict(out_mod_imp, newdata = df_imp),
+    dr_score = mu_hat + ipw_wt * (d_emp - mu_hat)
+  )
+
+
+# create event‐time
+df_imp <- df_imp %>%
+  mutate(event_time = year - first_review)
+
+fe_imp_es <- feols(
+  dr_score ~ i(event_time, ref = 0)
+  | county_name + year,
+  data    = df_imp,
+  weights = ~ ipw_wt,
+  cluster = ~ county_name
+)
+
+# plot
+iplot(fe_imp_es,
+      main = "Continuous DR Weighted ES (Imputed Panel)",
+      xlab = "Years since Yelp entry",
+      ylab = "ATT(emp)")
+
+```
+
+```{r}
+fe_imp_cont <- feols(
+  d_emp ~ d_review
+    | county_name + year,
+  data    = df_imp,
+  weights = ~ ipw_wt,
+  cluster = ~ county_name
+)
+summary(fe_imp_cont)
+
+```
+
+```{r}
+df_imp <- panels_wt_treated$agg_imp_covid
+
+df_imp <- df_imp %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    d_emp    = emp - lag(emp),                        
+    d_review = avg_log_reviews - lag(avg_log_reviews) 
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d_emp), !is.na(d_review), !is.na(ipw_wt))
+
+fe_imp_diff_wt <- feols( 
+  d_emp ~ d_review
+    | county_name + year,
+  data    = df_imp,
+  weights = ~ ipw_wt,
+  cluster = ~ county_name
+)
+
+summary(fe_imp_diff_wt)
+
+```
+
+
+```{r}
+ps_mod <- glm(
+  post_intro ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  family = binomial(),
+  data   = df
+)
+
+p_treated <- mean(df$post_intro, na.rm = TRUE)
+p_control <- 1 - p_treated
+
+df <- df %>%
+  mutate(
+    ps = predict(ps_mod, newdata = df, type = "response"),
+    sw = if_else(
+      post_intro == 1,
+      p_treated / ps,
+      p_control / (1 - ps)
+    )
+  )
+df_ps <- df %>%
+  filter(
+    !is.na(PC1), !is.na(PC2), !is.na(PC3), !is.na(PC4),
+    !is.na(region_name), !is.na(post_intro)
+  )
+
+ps_mod <- glm(
+  post_intro ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  family = binomial(),
+  data   = df_ps
+)
+
+p_treated <- mean(df_ps$post_intro)
+p_control <- 1 - p_treated
+
+df_ps <- df_ps %>%
+  mutate(
+    ps = predict(ps_mod, type = "response"),
+    sw = if_else(
+      post_intro == 1,
+      p_treated / ps,
+      p_control / (1 - ps)
+    )
+  )
+
+```
+
+
+```{r}
+fe_bin_sw <- feols(
+  qp1 ~ post_intro
+    | county_name + year,
+  data    = df,
+  weights = ~ sw,
+  cluster = ~ county_name
+)
+summary(fe_bin_sw)
+
+```
+
+```{r}
+did_list <- list(
+  emp  = did_mod2,     # your employment att_gt  
+  est  = did_est,      # establishments
+  ap   = did_ap,       # annual payroll
+  qp1  = did_qp1       # Q1 payroll
+)
+
+agg_summary <- imap_dfr(did_list, function(did_obj, outcome_name) {
+  agg <- aggte(did_obj, type = "simple", na.rm = TRUE)
+  tibble(
+    outcome = outcome_name,
+    ATT     = agg$overall.att,
+    SE      = agg$overall.se,
+    CI_lo   = agg$overall.att - 1.96 * agg$overall.se,
+    CI_hi   = agg$overall.att + 1.96 * agg$overall.se
+  )
+})
+
+# 3) inspect
+print(agg_summary)
+
+```
+
+```{r}
+write.table(
+  agg_summary,
+  file      = "aggregate_ATT_by_outcome.txt",
+  sep       = "\t",
+  row.names = FALSE,
+  quote     = FALSE
+)
+
+res_tex <- kable(
+  agg_summary,
+  format   = "latex",
+  booktabs = TRUE,
+  caption  = "Aggregate ATT by Outcome"
+)
+cat(res_tex, file = "aggregate_ATT_by_outcome.tex")
+
+```
+
+
+```{r}
+baseline_year <- agg_trim_pca_covid %>% 
+  pull(year) %>% 
+  min(na.rm = TRUE)
+
+bal_df <- agg_trim_pca_covid %>%
+  mutate(
+    ever_treated = !is.na(first_review),
+    pre_year     = if_else(ever_treated, first_review - 1L, baseline_year),
+    is_pre       = (year == pre_year)
+  ) %>%
+  filter(is_pre)
+
+bal_table <- bal_df %>%
+  group_by(ever_treated) %>%
+  summarise(
+    across(
+      c(PC1, PC2, PC3, PC4, avg_income_real, avg_age, pct_employed),
+      list(mean = ~ mean(.x, na.rm=TRUE),
+           sd   = ~ sd(  .x, na.rm=TRUE)),
+      .names = "{col}_{fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols        = -ever_treated,
+    names_to    = c("variable", "stat"),
+    names_pattern = "(.*)_(mean|sd)$"
+  ) %>%
+  pivot_wider(
+    names_from  = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    Group = if_else(ever_treated, "Ever-treated", "Never-treated")
+  ) %>%
+  select(Group, variable, mean, sd)
+
+# Markdown preview
+bal_table %>%
+  arrange(variable, Group) %>%
+  kable(format = "markdown")
+
+res_tex <- bal_table %>%
+  arrange(variable, Group) %>%
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Baseline Balance on PCs & Covariates"
+  )
+
+# 2) Write it out
+cat(
+  res_tex,
+  file = "baseline_balance.tex",
+  sep  = "\n"
+)
+
+```
+
+```{r}
+baseline_year <- agg_trim_pca_covid %>% 
+  pull(year) %>% 
+  min(na.rm = TRUE)
+
+bal_df <- agg_trim_pca_covid %>%
+  mutate(
+    ever_treated = !is.na(first_review),
+    pre_year     = if_else(ever_treated, first_review - 1L, baseline_year),
+    is_pre       = (year == pre_year)
+  ) %>%
+  filter(is_pre)
+
+bal_table <- bal_df %>%
+  group_by(ever_treated) %>%
+  summarise(
+    across(
+      c(PC1, PC2, PC3, PC4, avg_income_real, avg_age, pct_employed),
+      list(mean = ~ mean(.x, na.rm=TRUE),
+           sd   = ~ sd(  .x, na.rm=TRUE)),
+      .names = "{col}_{fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols        = -ever_treated,
+    names_to    = c("variable", "stat"),
+    names_pattern = "(.*)_(mean|sd)$"
+  ) %>%
+  pivot_wider(
+    names_from  = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    Group = if_else(ever_treated, "Ever-treated", "Never-treated")
+  ) %>%
+  select(Group, variable, mean, sd)
+
+# Markdown preview
+bal_table %>%
+  arrange(variable, Group) %>%
+  kable(format = "markdown")
+
+# 1) Generate the LaTeX for the balance table
+res_tex <- bal_table %>%
+  arrange(variable, Group) %>%
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Baseline Balance on PCs & Covariates"
+  )
+
+# 2) Write it out
+cat(
+  res_tex,
+  file = "baseline_balance.tex",
+  sep  = "\n"
+)
+
+```
+
+
+```{r}
+res_tex <- kable(
+  summary_df,
+  format   = "latex",
+  booktabs = TRUE,
+  caption  = "PC1–PC4: Variance Explained and Top Three Loadings"
+)
+cat(res_tex, file = "pc_summary.tex")
+
+write.table(
+  summary_df,
+  file       = "pc_summary.csv",
+  sep        = ",",
+  row.names  = FALSE,
+  quote      = FALSE
+)
+
+```
+
+
+```{r}
+dr_df <- did_mod2$DIDparams$data
+
+weights <- dr_df$.w
+
+qs <- quantile(weights,
+               probs = c(0, 0.01, 0.05, 0.50, 0.95, 0.99, 1),
+               na.rm = TRUE)
+
+
+weight_summary <- tibble(
+  Quantile = c("0%", "1%", "5%", "50%", "95%", "99%", "100%"),
+  Value    = as.numeric(qs)
+)
+
+print(weight_summary)
+
+```
+
+
+```{r}
+latex_weights <- kable(
+  weight_summary,
+  format   = "latex",
+  booktabs = TRUE,
+  caption  = "Distribution of DR–DiD Weights (\\.w)"
+)
+
+cat(
+  latex_weights,
+  file = "weight_distribution_table.tex"
+)
+
+```
+
+```{r}
+cohort_by_county <- 
+  agg_trim_pca_covid %>% 
+  distinct(county_name, first_review) 
+
+
+rollout_counts <- 
+  cohort_by_county %>% 
+  filter(!is.na(first_review)) %>% 
+  count(cohort_year = first_review) %>% 
+  arrange(cohort_year) 
+
+all_years <- tibble(cohort_year = 2005:2022)
+
+rollout_full <- 
+  all_years %>% 
+  left_join(rollout_counts, by = "cohort_year") %>% 
+  mutate(n = replace_na(n, 0L))
+
+print(rollout_full)
+
+```
+
+
+```{r}
+write_csv(rollout_full, "yelp_rollout_by_year.csv")
+
+rollout_full %>%
+  knitr::kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Number of U.S. Counties First Getting Yelp Reviews, by Year (2005–2022)"
+  ) %>%
+  write_lines("yelp_rollout_by_year.tex")
+
+```
+
+```{r}
+
+df_panel <- agg_trim_pca_covid
+
+
+
+yearly_review_summary <- df_panel %>%
+  filter(num_reviews > 0) %>%           
+  group_by(year) %>%                    
+  summarize(
+    n_counties_with_reviews = n_distinct(county_name),
+    avg_of_avg_rating       = mean(avg_rating, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  complete(year = 2005:2022, fill = list(
+    n_counties_with_reviews = 0L,
+    avg_of_avg_rating       = NA_real_
+  )) %>%
+  arrange(year)
+
+# 3) Inspect the result
+print(yearly_review_summary)
+
+```
+
+
+```{r}
+yearly_review_summary %>%
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    digits   = c(0, 0, 2),             
+    caption  = "Number of Counties with Yelp Reviews and Their Average Rating, by Year"
+  ) %>%
+  cat(
+    file = "yearly_counties_and_avg_rating.tex"
+  )
+
+```
+
+```{r}
+
+agg_trim_pca_covid <- agg_trim_pca_covid %>%
+  mutate(
+    g = as.integer(g), 
+    region_name = as.factor(region_name)
+  )
+
+
+treated_only <- agg_trim_pca_covid %>%
+  filter(g > 0)
+
+
+region_cohort_counts <- treated_only %>%
+  distinct(county_name, g, region_name) %>%   
+  count(region_name, g) %>%                    
+  arrange(region_name, g)
+
+print(region_cohort_counts)
+
+
+region_vs_year_wide <- region_cohort_counts %>%
+  tidyr::pivot_wider(
+    names_from  = g,
+    values_from = n,
+    values_fill = 0
+  )
+
+print(region_vs_year_wide)
+
+
+```
+
+
+```{r}
+
+dr_df <- did_mod2$DIDparams$data
+weights <- dr_df$.w
+qs <- quantile(weights, probs = c(0, 0.01, 0.05, 0.50, 0.95, 0.99, 1), na.rm = TRUE)
+library(tibble)
+weight_summary <- tibble(
+  Quantile = c("0%", "1%", "5%", "50%", "95%", "99%", "100%"),
+  Value    = as.numeric(qs)
+)
+print(weight_summary)
+
+latex_weights <- kable(
+  weight_summary,
+  format   = "latex",
+  booktabs = TRUE,
+  caption  = "Distribution of DR–DiD Weights (\\.w)"
+)
+cat(latex_weights, file = "weight_distribution_table.tex")
+
+```
+
+
+```{r}
+# 4 Treatment-rollout counts by year
+
+cohort_by_county <- agg_trim_pca_covid %>%
+  distinct(county_name, first_review)
+rollout_counts <- cohort_by_county %>%
+  filter(!is.na(first_review)) %>%
+  count(cohort_year = first_review) %>%
+  arrange(cohort_year)
+all_years <- tibble(cohort_year = 2005:2022)
+rollout_full <- all_years %>%
+  left_join(rollout_counts, by = "cohort_year") %>%
+  mutate(n = replace_na(n, 0L))
+print(rollout_full)
+
+write_csv(rollout_full, "yelp_rollout_by_year.csv")
+rollout_full %>%
+  knitr::kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Number of U.S. Counties First Getting Yelp Reviews, by Year (2005–2022)"
+  ) %>%
+  write_lines("yelp_rollout_by_year.tex")
+
+```
+
+
+
+```{r}
+# Counties reviews and ratings
+
+df_panel <- agg_trim_pca_covid
+yearly_review_summary <- df_panel %>%
+  filter(num_reviews > 0) %>%
+  group_by(year) %>%
+  summarize(
+    n_counties_with_reviews = n_distinct(county_name),
+    avg_of_avg_rating       = mean(avg_rating, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  complete(year = 2005:2022, fill = list(
+    n_counties_with_reviews = 0L,
+    avg_of_avg_rating       = NA_real_
+  )) %>%
+  arrange(year)
+print(yearly_review_summary)
+
+yearly_review_summary %>%
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    digits   = c(0, 0, 2),
+    caption  = "Number of Counties with Yelp Reviews and Their Average Rating, by Year"
+  ) %>%
+  cat(file = "yearly_counties_and_avg_rating.tex")
+
+```
+
+
+```{r}
+# 5 Region to treatment timing
+
+agg_trim_pca_covid <- agg_trim_pca_covid %>%
+  mutate(
+    g = as.integer(g),
+    region_name = as.factor(region_name)
+  )
+treated_only <- agg_trim_pca_covid %>%
+  filter(g > 0)
+region_cohort_counts <- treated_only %>%
+  distinct(county_name, g, region_name) %>%
+  count(region_name, g) %>%
+  arrange(region_name, g)
+print(region_cohort_counts)
+
+region_vs_year_wide <- region_cohort_counts %>%
+  tidyr::pivot_wider(
+    names_from  = g,
+    values_from = n,
+    values_fill = 0
+  )
+print(region_vs_year_wide)
+
+latex_tab <- kable(
+  region_vs_year_wide,
+  format      = "latex",
+  booktabs    = TRUE,
+  caption     = "Count of Counties by Region and First‐Review Year",
+  label       = "tab:region_by_year",
+  align       = rep("c", ncol(region_vs_year_wide))
+)
+cat(latex_tab, file = "region_by_year.tex")
+
+```
+
+```{r}
+# Means by year
+
+df_panel <- agg_imp_pca_covid
+yearly_means <- df_panel %>%
+  group_by(year) %>%
+  summarise(
+    mean_emp = mean(emp, na.rm = TRUE),
+    mean_est = mean(est, na.rm = TRUE),
+    mean_ap  = mean(ap, na.rm = TRUE),
+    mean_qp1 = mean(qp1, na.rm = TRUE)
+  ) %>%
+  ungroup()
+yearly_means
+
+yearly_tex <- kable(
+  yearly_means,
+  format   = "latex",
+  booktabs = TRUE,
+  digits   = 0,
+  caption  = "County‐Level Mean Outcomes, 2005–2022"
+)
+cat(yearly_tex, file = "yearly_means.tex")
+
+```
+
+```{r}
+# Pre-treatment balance
+
+df_full <- agg_imp_pca_covid
+df_pre2005 <- df_full %>%
+  mutate(
+    first_review = as.integer(first_review),
+    ever_treated  = (!is.na(first_review) & first_review > 2005),
+    never_treated = is.na(first_review)
+  ) %>%
+  filter(
+    year == 2005,
+    is.na(first_review) | first_review > 2005
+  ) %>%
+  select(county_name, ever_treated, never_treated, PC1, PC2, PC3, PC4, emp, est, ap, qp1)
+
+vars_to_test <- c("PC1","PC2","PC3","PC4","emp","est","ap","qp1")
+balance_tbl <- tibble(
+  variable   = character(),
+  mean_ever  = numeric(),
+  mean_never = numeric(),
+  t_stat     = numeric(),
+  p_value    = numeric()
+)
+for (v in vars_to_test) {
+  tmp <- df_pre2005 %>% select(!!sym(v), ever_treated) %>%
+         rename(x = !!sym(v))
+  tt  <- t.test(x ~ ever_treated, data = tmp)
+  balance_tbl <- bind_rows(balance_tbl, tibble(
+    variable   = v,
+    mean_ever  = mean(tmp$x[tmp$ever_treated], na.rm = TRUE),
+    mean_never = mean(tmp$x[tmp$ever_treated == FALSE], na.rm = TRUE),
+    t_stat     = as.numeric(tt$statistic),
+    p_value    = tt$p.value
+  ))
+}
+print(balance_tbl)
+
+balance_tex <- kable(
+  balance_tbl,
+  format   = "latex",
+  booktabs = TRUE,
+  digits   = c(0, 3, 3, 2, 3),
+  caption  = "Pre‐Treatment Balance: 2005 Means (Ever‐Treated vs Never‐Treated)"
+)
+cat(balance_tex, file = "pre_treatment_balance.tex")
+
+```
+
+
+
+```{r}
+# One DID per sector
+
+all_sectors <- c("Food", "Health", "Other", "Retail")
+all_counties <- agg_imp_pca_covid %>%
+  distinct(county_name) %>%
+  pull(county_name)
+all_years <- sort(unique(agg_imp_pca_covid$year))
+full_sector_grid <- expand.grid(
+  county_name    = all_counties,
+  category_group = all_sectors,
+  year           = all_years,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble()
+sect_full <- full_sector_grid %>%
+  left_join(
+    sect_imp_pca_covid %>%
+      select(county_name, category_group, year, num_reviews, avg_log_reviews, avg_rating),
+    by = c("county_name", "category_group", "year")
+  ) %>%
+  mutate(
+    num_reviews     = replace_na(num_reviews,    0),
+    avg_log_reviews = replace_na(avg_log_reviews, 0),
+    avg_rating      = replace_na(avg_rating,     0)
+  )
+sect_full2 <- sect_full %>%
+  left_join(
+    agg_imp_pca_covid %>%
+      select(county_name, year, PC1, PC2, PC3, PC4, covid_case_pct, covid_death_pct,
+             region_name, emp, est, ap, qp1),
+    by = c("county_name", "year")
+  )
+sect_full3 <- sect_full2 %>%
+  group_by(county_name, category_group) %>%
+  mutate(
+    sector_first_review = if_else(
+      any(num_reviews > 0),
+      min(year[num_reviews > 0]),
+      NA_integer_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    g        = if_else(is.na(sector_first_review), 0L, sector_first_review),
+    unit_key = paste(county_name, category_group, sep = "_"),
+    unit_id  = as.integer(factor(unit_key)),
+    year_num = as.integer(year)
+  ) %>%
+  select(
+    county_name, category_group, unit_id, year_num, g,
+    PC1, PC2, PC3, PC4, region_name,
+    num_reviews, avg_log_reviews, avg_rating,
+    emp, est, ap, qp1
+  )
+sect_full3 %>%
+  group_by(category_group) %>%
+  summarize(
+    total_counties_here = n_distinct(unit_id),
+    n_ever_treated      = n_distinct(unit_id[g > 0]),
+    n_never_treated     = n_distinct(unit_id[g == 0])
+  )
+
+```{r sector-did-loop}
+# FIX: replaced four near-identical sector_dids/sector_dids1/sector_dids2/sector_dids3
+# blocks with a single loop over outcomes. Results stored in a named list.
+# Access: sector_dids_all[["emp"]][["Food"]]
+
+outcomes <- c("emp", "est", "ap", "qp1")
+
+set.seed(42)
+sector_dids_all <- map(outcomes, function(yvar) {
+  purrr::imap(
+    split(sect_full3, sect_full3$category_group),
+    ~ {
+      message("  → att_gt(): outcome = ", yvar, "  sector = ", .y)
+      att_gt(
+        yname         = yvar,
+        tname         = "year_num",
+        idname        = "unit_id",
+        gname         = "g",
+        xformla       = ~ PC1 + PC2 + PC3 + PC4 + region_name,
+        data          = .x,
+        control_group = "notyettreated",
+        est_method    = "dr",
+        bstrap        = TRUE,
+        biters        = 200,
+        cband         = FALSE
+      )
+    }
+  )
+}) |> set_names(outcomes)
+
+# Aggregate ATT per outcome per sector and export LaTeX tables
+outcome_labels <- c(
+  emp  = "Employment",
+  est  = "Establishments",
+  ap   = "Annual Payroll",
+  qp1  = "1st Quarter Payroll"
+)
+
+walk(outcomes, function(yvar) {
+  agg_df <- purrr::imap_dfr(
+    sector_dids_all[[yvar]],
+    function(did_obj, sector_name) {
+      overall <- aggte(did_obj, type = "simple", na.rm = TRUE)
+      tibble(
+        sector = sector_name,
+        ATT    = overall$overall.att,
+        SE     = overall$overall.se,
+        CI_lo  = overall$overall.att - 1.96 * overall$overall.se,
+        CI_hi  = overall$overall.att + 1.96 * overall$overall.se
+      )
+    }
+  ) |> as.data.frame()
+
+  print(agg_df)
+
+  tex <- kable(
+    agg_df,
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = paste0(
+      "Doubly-Robust Staggered DiD: Aggregate ATT for ",
+      outcome_labels[[yvar]], ", by Yelp Category"
+    )
+  )
+  writeLines(tex, paste0("sector_ATT_", yvar, ".tex"))
+})
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
