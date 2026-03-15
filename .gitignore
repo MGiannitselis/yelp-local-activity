@@ -1,0 +1,13 @@
+*.json
+*.dta
+*.shp
+*.shx
+*.dbf
+*.prj
+*.rds
+*.RData
+*.csv
+*.txt
+*.pdf
+.Rhistory
+.Rproj.user/
