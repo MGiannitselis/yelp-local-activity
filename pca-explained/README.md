@@ -32,6 +32,15 @@ in the underlying demographics. Instead of seven noisy, correlated
 controls, the regressions in [`did-analysis/`](../did-analysis/) use
 four clean, orthogonal ones (`PC1`–`PC4`).
 
+There's also a conceptual motivation beyond fixing multicollinearity:
+a county's demographic profile isn't really seven independent facts —
+it's a *combination* of characteristics that tend to move together
+(e.g. income, education, and employment jointly describing something
+like "socioeconomic status"). PCA surfaces those underlying combinations
+directly, so the controls used in the regressions reflect how these
+characteristics actually co-vary across counties, rather than treating
+each variable as if it told an independent story.
+
 ## Why standardize first
 
 `prcomp(..., center = TRUE, scale. = TRUE)` puts every variable on the
