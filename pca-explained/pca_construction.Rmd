@@ -1,0 +1,81 @@
+---
+title: "PCA for Demographic Controls"
+author: "Manos Giannitselis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tibble)
+```
+
+```{r example-data, echo=FALSE}
+# Small simulated stand-in for the real county-year panel, so this file
+# runs standalone. See README for the real construction of control_df.
+set.seed(42)
+control_df <- tibble(
+  county_name     = rep(paste0("County_", 1:20), each = 5),
+  year            = rep(2015:2019, times = 20),
+  pct_employed    = rnorm(100, 0.60, 0.05),
+  avg_educ        = rnorm(100, 13, 1.5),
+  total_pop       = rnorm(100, 50000, 15000),
+  pct_female      = rnorm(100, 0.50, 0.02),
+  avg_age         = rnorm(100, 38, 4),
+  pct_white       = rnorm(100, 0.70, 0.15),
+  avg_income_real = rnorm(100, 45000, 8000)
+)
+```
+
+```{r run-pca}
+n_pcs <- 4
+
+# center/scale = TRUE standardizes each variable first, so population
+# (tens of thousands) doesn't swamp percentage variables (0-1).
+pca <- prcomp(
+  control_df %>% select(-county_name, -year),
+  center = TRUE,
+  scale. = TRUE
+)
+
+summary(pca)
+```
+
+```{r scree-plot}
+# Used to pick n_pcs: keep components up to the "elbow".
+screeplot(pca, type = "lines")
+```
+
+```{r loadings}
+# Loadings = which raw variables each component is built from.
+print(pca$rotation[, 1:n_pcs], digits = 2)
+```
+
+```{r extract-scores}
+# Scores = each county-year's value on each component; this is what
+# gets merged back into the panel and used as a regression control.
+scores <- as_tibble(pca$x[, 1:n_pcs], rownames = "row_id") %>%
+  setNames(c("row_id", paste0("PC", 1:n_pcs))) %>%
+  mutate(row_id = as.integer(row_id)) %>%
+  select(-row_id) %>%
+  bind_cols(control_df %>% select(county_name, year), .)
+
+head(scores)
+```
+
+```{r real-data, eval=FALSE}
+# In the actual project, control_df is built like this from the full
+# panel (agg_panel_trim), and scores are joined back on before running
+# the DiD/IV regressions in did-analysis/:
+
+control_df <- agg_panel_trim %>%
+  select(
+    county_name, year,
+    pct_employed, avg_educ, total_pop,
+    pct_female, avg_age, pct_white, avg_income_real
+  ) %>%
+  na.omit()
+
+panel_with_controls <- panel %>%
+  left_join(scores, by = c("county_name", "year"))
+```
