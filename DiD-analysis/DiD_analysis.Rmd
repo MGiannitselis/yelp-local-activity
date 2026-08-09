@@ -1,0 +1,106 @@
+---
+title: "Staggered Difference-in-Differences (Callaway & Sant'Anna)"
+author: "Manos Giannitselis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(did)      # Callaway & Sant'Anna (2021) estimator
+library(ggplot2)
+```
+
+```{r example-data, echo=FALSE}
+# Small simulated stand-in for the real county-year panel, so this file
+# runs standalone. See treatment-definition/ and pca-explained/ for how
+# `g` (first treated year) and PC1-PC4 are actually constructed.
+set.seed(42)
+n_counties <- 60
+years <- 2015:2023
+
+county_first_treat <- tibble(
+  county_id = 1:n_counties,
+  g = sample(c(0, 2018:2021), n_counties, replace = TRUE,
+             prob = c(0.25, 0.2, 0.2, 0.2, 0.15))  # g = 0 means never treated
+)
+
+df <- expand.grid(county_id = 1:n_counties, year = years) %>%
+  left_join(county_first_treat, by = "county_id") %>%
+  mutate(
+    region_name = factor(rep(c("North", "South", "East", "West"), length.out = n())),
+    PC1 = rnorm(n()), PC2 = rnorm(n()), PC3 = rnorm(n()), PC4 = rnorm(n()),
+    treated_now = as.integer(g != 0 & year >= g),
+    est = 100 + 2 * (year - min(years)) +
+      treated_now * 5 +                     # true treatment effect
+      county_id * 0.1 + rnorm(n(), 0, 3)     # county-level noise
+  )
+```
+
+## Estimating group-time ATTs
+
+```{r att-gt}
+did_est <- att_gt(
+  yname         = "est",              # outcome: number of establishments
+  tname         = "year",
+  idname        = "county_id",
+  gname         = "g",                 # first-treated year (0 = never treated)
+  xformla       = ~ PC1 + PC2 + PC3 + PC4 + region_name,
+  data          = df,
+  control_group = "notyettreated",
+  est_method    = "dr",                # doubly robust
+  bstrap        = TRUE,
+  biters        = 200,
+  cband         = TRUE
+)
+
+summary(did_est)
+```
+
+## Aggregating to a single overall effect
+
+```{r aggregate-simple}
+agg_est <- aggte(did_est, type = "simple", na.rm = TRUE)
+summary(agg_est)
+```
+
+## Event-study (dynamic) aggregation
+
+```{r aggregate-dynamic}
+es_est <- aggte(did_est, type = "dynamic", na.rm = TRUE)
+
+df_es <- tibble(
+  event_time = es_est$egt,
+  att        = es_est$att.egt,
+  se         = es_est$se.egt
+) %>%
+  mutate(
+    ci_low  = att - 1.96 * se,
+    ci_high = att + 1.96 * se
+  )
+
+df_es
+```
+
+```{r event-study-plot}
+ggplot(df_es, aes(x = event_time, y = att)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray40") +
+  labs(
+    title = "Event Study: Effect of Yelp Review Surge on Establishments",
+    x = "Years Since Treatment",
+    y = "ATT"
+  ) +
+  theme_minimal()
+```
+
+## Pre-trends check
+
+```{r pre-trends}
+# Pre-treatment event-time estimates (t < 0) should be statistically
+# indistinguishable from zero if parallel trends holds.
+df_es %>% filter(event_time < 0)
+```
