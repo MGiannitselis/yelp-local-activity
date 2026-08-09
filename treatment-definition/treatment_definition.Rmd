@@ -1,0 +1,99 @@
+---
+title: "Defining Treatment: Yelp Review Surges"
+author: "Manos Giannitselis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+```
+
+```{r example-data, echo=FALSE}
+# Small simulated stand-in for the real county-year panel (agg_trim_pca),
+# so this file runs standalone. See README for context.
+set.seed(42)
+n_counties <- 30
+years <- 2015:2023
+
+df <- expand.grid(
+  county_name = paste0("County_", 1:n_counties),
+  year        = years
+) %>%
+  arrange(county_name, year) %>%
+  group_by(county_name) %>%
+  mutate(
+    # simulate a review "takeoff" at a random year for some counties
+    takeoff_year   = sample(c(2017:2021, rep(NA, 10)), 1),
+    avg_log_reviews = ifelse(
+      !is.na(takeoff_year) & year >= takeoff_year,
+      rnorm(n(), 3, 0.5),
+      rnorm(n(), 1, 0.3)
+    )
+  ) %>%
+  ungroup()
+```
+
+## Binary treatment: percentile threshold
+
+```{r binary-treatment}
+# A county-year is "high review activity" if avg_log_reviews exceeds the
+# 75th percentile of the full sample that year-over-year.
+thr75 <- quantile(df$avg_log_reviews, 0.75, na.rm = TRUE)
+
+first_treat <- df %>%
+  group_by(county_name) %>%
+  summarise(first_year = min(year[avg_log_reviews > thr75], na.rm = TRUE), .groups = "drop")
+
+did_df <- df %>%
+  left_join(first_treat, by = "county_name") %>%
+  mutate(
+    treated   = as.integer(!is.na(first_year)),
+    post      = as.integer(year >= first_year),
+    did_bin   = treated * post   # binary DiD interaction term
+  )
+
+table(did_df$treated)
+head(did_df %>% select(county_name, year, avg_log_reviews, first_year, treated, post, did_bin), 10)
+```
+
+```{r binary-treatment-plot}
+did_df %>%
+  filter(!is.na(first_year)) %>%
+  distinct(county_name, first_year) %>%
+  ggplot2::ggplot(ggplot2::aes(x = first_year)) +
+  ggplot2::geom_bar() +
+  ggplot2::labs(
+    title = "Timing of First Treatment (Yelp Surge)",
+    x = "Year", y = "Number of Counties"
+  )
+```
+
+## Continuous treatment: review intensity
+
+```{r continuous-treatment}
+# Instead of collapsing review activity into 0/1, use the raw intensity
+# (log reviews) directly, interacted with the post-treatment window.
+did_df <- did_df %>%
+  mutate(
+    intensity = avg_log_reviews,
+    did_cont  = intensity * post
+  )
+
+head(did_df %>% select(county_name, year, intensity, post, did_cont), 10)
+```
+
+## Alternative thresholds
+
+```{r alt-thresholds}
+# Rather than committing to one arbitrary cutoff, multiple percentile
+# thresholds are tried (60th, 75th, 90th) to see how the binary
+# treatment definition behaves as the bar for "high review activity"
+# is raised or lowered. This was also a step toward thinking about
+# treatment as a matter of degree (dosage) rather than yes/no -- which
+# is what the continuous specification above captures more directly.
+thr60 <- quantile(df$avg_log_reviews, 0.60, na.rm = TRUE)
+thr90 <- quantile(df$avg_log_reviews, 0.90, na.rm = TRUE)
+
+c(thr60 = thr60, thr75 = thr75, thr90 = thr90)
+```
