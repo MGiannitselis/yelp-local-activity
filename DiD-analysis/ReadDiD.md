@@ -82,6 +82,40 @@ Two things to look for:
    crossing the review-activity threshold, and whether it grows,
    shrinks, or stays flat as time since treatment passes.
 
+## What this doesn't solve, and why C&S was still the right call to lead with
+
+Before settling on Callaway & Sant'Anna as the main specification, a
+range of other approaches were tried and compared — standard TWFE, an
+IV-based specification, and other staggered-DiD variants — partly to
+understand how sensitive the results were to the choice of estimator,
+and partly because working through several methods surfaces a better
+understanding of what each one actually assumes.
+
+C&S was chosen to lead with because it directly addresses the
+staggered-adoption bias that plain TWFE is known to have, and because
+the never-treated group in this sample was small enough that using
+not-yet-treated counties as controls made better use of the data (see
+above). But it doesn't resolve two deeper identification concerns that
+remain open questions rather than solved problems:
+
+- **Possible reverse causality in treatment timing.** If a business
+  actively encourages customers to leave reviews once it's already
+  doing well, "crossing the review-activity threshold" could partly be
+  a *symptom* of local business success rather than its cause — i.e.
+  treatment timing itself may not be as good as random.
+- **Uneven baseline access to the platform.** Not every county had
+  equal access to, or awareness of, Yelp from the start of the sample,
+  which complicates treating "first crossing the threshold" as a clean,
+  comparable event across counties.
+
+Neither issue has an estimator that fully resolves it — a fuller
+dataset (e.g. with information on *why* review activity increased in a
+given county-year) would help more than switching estimators would. C&S
+handles the piece of the identification problem it's designed for
+(staggered timing); the rest is a genuine limitation of what's
+identifiable from this data, not something a different DiD variant
+would fix.
+
 ## Summary
 
 | Choice | Reason |
