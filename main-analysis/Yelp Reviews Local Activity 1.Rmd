@@ -1,6 +1,6 @@
 ---
 title: "Reviews online and market dynamics"
-author: "Manos Giannitselis"
+author: "Manolis Giannitselis"
 date: "2024-11-28"
 output: html_document
 ---
