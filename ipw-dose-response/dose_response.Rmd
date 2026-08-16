@@ -1,0 +1,125 @@
+---
+title: "Dose-Response: Does More Review Growth Mean a Bigger Effect?"
+author: "Manolis Giannitselis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+```
+
+```{r example-data, echo=FALSE}
+# Small simulated stand-in for the real panel, so this file runs
+# standalone. ipw_wt comes from the same weighting function used in
+# robustness-checks/.
+set.seed(42)
+n_counties <- 60
+years <- 2015:2023
+
+df <- expand.grid(county_id = 1:n_counties, year = years) %>%
+  arrange(county_id, year) %>%
+  group_by(county_id) %>%
+  mutate(
+    PC1 = rnorm(n()), PC2 = rnorm(n()), PC3 = rnorm(n()), PC4 = rnorm(n()),
+    avg_log_reviews = rnorm(n(), 2, 1) + 0.1 * (year - min(years)),
+    d_review = avg_log_reviews - lag(avg_log_reviews),
+    emp   = 500 + 3 * (year - min(years)) + 8 * pmax(d_review, 0) + rnorm(n(), 0, 5),
+    d_emp = emp - lag(emp)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d_review), !is.na(d_emp))
+
+make_ipw_treated <- function(data){
+  mu0 <- mean(data$d_review); sigma0 <- sd(data$d_review)
+  cond_mod  <- lm(d_review ~ PC1 + PC2 + PC3 + PC4, data = data)
+  mu_hat    <- predict(cond_mod, data)
+  sigma_hat <- sd(residuals(cond_mod))
+  data %>%
+    mutate(
+      log_wt   = dnorm(d_review, mu0, sigma0, log = TRUE) -
+                 dnorm(d_review, mu_hat, sigma_hat, log = TRUE),
+      log_wt_c = log_wt - median(log_wt, na.rm = TRUE),
+      ipw_wt   = exp(log_wt_c),
+      ipw_wt   = ipw_wt / mean(ipw_wt, na.rm = TRUE)
+    )
+}
+
+df <- make_ipw_treated(df)
+```
+
+## Step 1: Model the expected change in employment
+
+```{r outcome-model}
+# Predicts d_emp from the change in reviews and the same PCA controls
+# used throughout the project.
+outcome_mod <- lm(d_emp ~ d_review + PC1 + PC2 + PC3 + PC4, data = df)
+summary(outcome_mod)
+```
+
+## Step 2: Combine into a doubly-robust score
+
+```{r dr-score}
+df <- df %>%
+  mutate(
+    mu_hat_emp = predict(outcome_mod, newdata = df),
+    dr_score   = mu_hat_emp + ipw_wt * (d_emp - mu_hat_emp)
+  )
+
+hist(df$dr_score, breaks = 30, main = "DR Scores", xlab = "dr_score")
+```
+
+`dr_score` combines the outcome model's prediction with an
+IPW-weighted correction term — the same doubly-robust logic behind the
+main DiD specification (see [`did-analysis/`](../did-analysis/)), but
+applied here directly to a continuous measure of review growth rather
+than a binary treatment indicator.
+
+## Step 3: Bin by review growth and look for a dose-response pattern
+
+```{r binned-dose-response}
+df_bins <- df %>%
+  mutate(bin = ntile(d_review, 4), mid = ave(d_review, bin, FUN = mean))
+
+dose_resp <- df_bins %>%
+  group_by(bin, mid) %>%
+  summarise(
+    avg_dr = mean(dr_score, na.rm = TRUE),
+    sd_dr  = sd(dr_score, na.rm = TRUE),
+    n_obs  = n(),
+    se_dr  = sd_dr / sqrt(n_obs),
+    ci_lo  = avg_dr - 1.96 * se_dr,
+    ci_hi  = avg_dr + 1.96 * se_dr,
+    .groups = "drop"
+  )
+
+dose_resp
+```
+
+```{r dose-response-plot}
+with(dose_resp, {
+  plot(mid, avg_dr, ylim = range(ci_lo, ci_hi),
+       pch = 16, xlab = "Change in avg_log_reviews (bin midpoint)",
+       ylab = "Average DR Score (change in employment)",
+       main = "Dose-Response with 95% CI")
+  arrows(mid, ci_lo, mid, ci_hi, angle = 90, code = 3, length = 0.05)
+})
+```
+
+## Why this check matters
+
+The main DiD result answers a yes/no question: did crossing the review
+threshold change local business activity? It doesn't say whether a
+*bigger* increase in reviews produces a *bigger* effect, or whether the
+effect is flat once any meaningful increase happens. Binning
+counties by how much their review activity actually grew, and plotting
+the average doubly-robust score in each bin, is a way of checking for
+that dose-response pattern directly — a genuine causal relationship
+would generally be expected to show *some* upward pattern across bins,
+rather than a flat line or something non-monotonic.
+
+This isn't a formal robustness check in the same sense as the ones in
+[`robustness-checks/`](../robustness-checks/) — it's closer to
+probing whether the binary treatment story in `did-analysis/` is
+hiding a richer relationship underneath, rather than confirming or
+rejecting the main estimate directly.
