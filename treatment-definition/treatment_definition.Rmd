@@ -1,6 +1,6 @@
 ---
 title: "Defining Treatment: Yelp Review Surges"
-author: "Manos Giannitselis"
+author: "Manolis Giannitselis"
 output: html_document
 ---
 
