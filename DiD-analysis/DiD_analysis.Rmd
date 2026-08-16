@@ -1,6 +1,6 @@
 ---
 title: "Staggered Difference-in-Differences (Callaway & Sant'Anna)"
-author: "Manos Giannitselis"
+author: "Manolis Giannitselis"
 output: html_document
 ---
 
