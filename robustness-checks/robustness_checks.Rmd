@@ -1,0 +1,150 @@
+---
+title: "Robustness Checks"
+author: "Manolis Giannitselis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(fixest)
+library(sandwich)
+library(lmtest)
+```
+
+```{r example-data, echo=FALSE}
+# Small simulated stand-in for the real panel, so this file runs
+# standalone. See pca-explained/, treatment-definition/, and
+# did-analysis/ for how PC1-PC4, avg_log_reviews, and g are actually
+# constructed from the real data.
+set.seed(42)
+n_counties <- 60
+years <- 2015:2023
+sectors <- c("Food", "Health", "Retail", "Other")
+
+county_first_treat <- tibble(
+  county_id = 1:n_counties,
+  g = sample(c(0, 2018:2021), n_counties, replace = TRUE,
+             prob = c(0.25, 0.2, 0.2, 0.2, 0.15))
+)
+
+df <- expand.grid(county_id = 1:n_counties, year = years, sector = sectors) %>%
+  left_join(county_first_treat, by = "county_id") %>%
+  mutate(
+    county_sector    = paste(county_id, sector, sep = "_"),
+    PC1 = rnorm(n()), PC2 = rnorm(n()), PC3 = rnorm(n()), PC4 = rnorm(n()),
+    avg_log_reviews  = rnorm(n(), 2, 1),
+    event_time       = ifelse(g != 0, year - g, NA_real_),
+    treated_now      = as.integer(g != 0 & year >= g),
+    # sector-specific effect size, so heterogeneity check has something to find
+    sector_effect    = case_when(sector == "Food" ~ 7, sector == "Retail" ~ 4, TRUE ~ 1),
+    est = 100 + 2 * (year - min(years)) +
+      treated_now * sector_effect +
+      county_id * 0.05 + rnorm(n(), 0, 3)
+  )
+```
+
+## 1. IPW-weighted regression (alternative to the doubly-robust DiD)
+
+```{r ipw-weights}
+# Weight construction: model the change in review activity as a
+# function of the PCA controls, then weight each observation by how
+# "surprising" its actual review change was relative to that model.
+make_ipw_treated <- function(data){
+  data2 <- data %>%
+    arrange(county_id, year) %>%
+    group_by(county_id) %>%
+    mutate(d_review = avg_log_reviews - lag(avg_log_reviews)) %>%
+    ungroup() %>%
+    filter(!is.na(d_review))
+
+  mu0    <- mean(data2$d_review)
+  sigma0 <- sd(data2$d_review)
+
+  cond_mod  <- lm(d_review ~ PC1 + PC2 + PC3 + PC4, data = data2)
+  mu_hat    <- predict(cond_mod, data2)
+  sigma_hat <- sd(residuals(cond_mod))
+
+  data2 %>%
+    mutate(
+      log_wt   = dnorm(d_review, mu0, sigma0, log = TRUE) -
+                 dnorm(d_review, mu_hat, sigma_hat, log = TRUE),
+      log_wt_c = log_wt - median(log_wt, na.rm = TRUE),
+      ipw_wt   = exp(log_wt_c),
+      ipw_wt   = ipw_wt / mean(ipw_wt, na.rm = TRUE)
+    )
+}
+
+df_wt <- make_ipw_treated(df) %>% filter(!is.na(ipw_wt))
+
+hist(df_wt$ipw_wt, breaks = 30, main = "IPW Weights", xlab = "Weight")
+```
+
+```{r ipw-regression}
+fe_ipw <- lm(
+  est ~ avg_log_reviews + PC1 + PC2 + PC3 + PC4 + factor(county_id) + factor(year),
+  data    = df_wt,
+  weights = ipw_wt
+)
+
+coeftest(fe_ipw, vcov = vcovCL, cluster = ~county_id)["avg_log_reviews", ]
+```
+
+## 2. Sector heterogeneity
+
+```{r sector-event-study}
+# Same event-study logic as did-analysis/, but with county x sector as
+# the panel unit, to see whether the effect is concentrated in
+# particular kinds of businesses rather than uniform across all of them.
+es_sec <- df %>% filter(!is.na(event_time) & between(event_time, -4, 4))
+
+es_mod_sec <- feols(
+  est ~ i(event_time, ref = -1) | county_sector + year,
+  cluster = ~county_sector,
+  data    = es_sec
+)
+
+iplot(
+  es_mod_sec,
+  xlab = "Years since first Yelp review (sector)",
+  main = "Event Study by Sector"
+)
+```
+
+```{r sector-means}
+df %>%
+  filter(!is.na(event_time)) %>%
+  mutate(post = event_time >= 0) %>%
+  group_by(sector, post) %>%
+  summarise(mean_est = mean(est, na.rm = TRUE), n = n(), .groups = "drop")
+```
+
+## 3. Sensitivity to the treatment threshold
+
+```{r threshold-sensitivity}
+# Re-derive binary treatment at 60th / 75th / 90th percentiles (see
+# treatment-definition/) and compare the resulting effect size, to
+# check the main result isn't an artifact of exactly where the line
+# is drawn.
+run_at_threshold <- function(pct) {
+  thr <- quantile(df$avg_log_reviews, pct, na.rm = TRUE)
+
+  first_treat <- df %>%
+    group_by(county_id) %>%
+    summarise(first_year = min(year[avg_log_reviews > thr], na.rm = TRUE), .groups = "drop")
+
+  d <- df %>%
+    left_join(first_treat, by = "county_id") %>%
+    mutate(
+      treated = as.integer(!is.na(first_year)),
+      post    = as.integer(year >= first_year),
+      did_bin = treated * post
+    )
+
+  mod <- feols(est ~ did_bin | county_id + year, cluster = ~county_id, data = d)
+  broom::tidy(mod) %>% filter(term == "did_bin") %>% mutate(percentile = pct)
+}
+
+results <- purrr::map_dfr(c(0.60, 0.75, 0.90), run_at_threshold)
+results
+```
