@@ -1,6 +1,6 @@
 ---
 title: "PCA for Demographic Controls"
-author: "Manos Giannitselis"
+author: "Manolis Giannitselis"
 output: html_document
 ---
 
